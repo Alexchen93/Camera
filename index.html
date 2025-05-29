@@ -4,93 +4,113 @@
   <meta charset="UTF-8">
   <meta http-equiv="X-UA-Compatible" content="IE=edge">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>深蹲計數示範</title>
+  <title>深蹲次數辨識</title>
   <style>
-    body { margin: 0; padding: 0; display: flex; flex-direction: column; align-items: center; font-family: sans-serif; background: #fafafa; }
-    .video-container { display: flex; flex-direction: row; justify-content: center; align-items: center; gap: 10px; }
-    video, canvas { transform: scaleX(-1); border: 1px solid #ccc; }
-    #count { margin-top: 10px; font-size: 2rem; color: #333; }
-    h1 { margin: 20px 0 10px; }
+    body { margin: 0; display: flex; flex-direction: column; align-items: center; background: #fafafa; font-family: sans-serif; }
+    video { display: none; }
+    canvas { transform: scaleX(-1); border: 1px solid #ccc; }
+    #totalCount { margin: 20px 0 5px; font-size: 2.5rem; color: #333; }
+    #detailCount { margin-bottom: 20px; font-size: 1.5rem; color: #555; }
   </style>
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose@0.5/pose.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils@0.3/camera_utils.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils@0.3/drawing_utils.js"></script>
 </head>
 <body>
-  <h1>深蹲次數：<span id="count">0</span></h1>
-  <div class="video-container">
-    <video id="video" width="640" height="480" autoplay muted playsinline></video>
-    <canvas id="canvas" width="640" height="480"></canvas>
-  </div>
-
+  <div id="totalCount">總次數：0</div>
+  <div id="detailCount">正確：0，錯誤：0</div>
+  <video id="video" width="640" height="480" autoplay muted playsinline></video>
+  <canvas id="canvas" width="640" height="480"></canvas>
   <script>
-    const videoElement  = document.getElementById('video');
-    const canvasElement = document.getElementById('canvas');
-    const canvasCtx     = canvasElement.getContext('2d');
-    const countElem     = document.getElementById('count');
+    const video      = document.getElementById('video');
+    const canvas     = document.getElementById('canvas');
+    const ctx        = canvas.getContext('2d');
+    const totalDiv   = document.getElementById('totalCount');
+    const detailDiv  = document.getElementById('detailCount');
 
-    let squatCount = 0;
-    let squatState = 'up';
-    const DOWN_THRESHOLD = 90;
-    const UP_THRESHOLD   = 160;
+    // 狹義閾值調整：更嚴格的下蹲及起身檢測
+    const DOWN_THRESHOLD = 80;    // 膝關節角度 ≤ 80° 视为合格下蹲
+    const UP_THRESHOLD   = 150;   // 膝關節角度 ≥ 150° 视为站直
+    const STABLE_FRAMES  = 8;     // 持續幾幀才切換狀態
 
-    function calculateAngle(a, middle, b) {
-      const vx1 = a.x - middle.x;
-      const vy1 = a.y - middle.y;
-      const vx2 = b.x - middle.x;
-      const vy2 = b.y - middle.y;
-      const dot = vx1 * vx2 + vy1 * vy2;
-      const mag1 = Math.hypot(vx1, vy1);
-      const mag2 = Math.hypot(vx2, vy2);
-      const cos = dot / (mag1 * mag2);
-      return Math.acos(Math.min(Math.max(cos, -1), 1)) * 180 / Math.PI;
+    let state          = 'up';    // 初始狀態
+    let minAngle       = 180;
+    let correctCount   = 0;
+    let incorrectCount = 0;
+    let downFrames     = 0;
+    let upFrames       = 0;
+
+    function calcAngle(a, b, c) {
+      const v1 = {x: a.x - b.x, y: a.y - b.y};
+      const v2 = {x: c.x - b.x, y: c.y - b.y};
+      const dot = v1.x * v2.x + v1.y * v2.y;
+      const m1  = Math.hypot(v1.x, v1.y);
+      const m2  = Math.hypot(v2.x, v2.y);
+      const cos = dot / (m1 * m2);
+      return Math.acos(Math.max(-1, Math.min(1, cos))) * 180 / Math.PI;
+    }
+
+    function updateCount() {
+      const total = correctCount + incorrectCount;
+      totalDiv.textContent  = `總次數：${total}`;
+      detailDiv.textContent = `正確：${correctCount}，錯誤：${incorrectCount}`;
     }
 
     function onResults(results) {
-      canvasCtx.save();
-      canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
-      canvasCtx.drawImage(results.image, 0, 0, canvasElement.width, canvasElement.height);
-
+      ctx.save();
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(results.image, 0, 0, canvas.width, canvas.height);
       if (results.poseLandmarks) {
-        window.drawConnectors(canvasCtx, results.poseLandmarks, window.POSE_CONNECTIONS, {lineWidth: 4, color: '#00FF00'});
-        window.drawLandmarks(canvasCtx, results.poseLandmarks, {lineWidth: 2, color: '#FF0000', radius: 3});
+        window.drawConnectors(ctx, results.poseLandmarks, window.POSE_CONNECTIONS, {lineWidth: 4, color: '#00FF00'});
+        window.drawLandmarks(ctx, results.poseLandmarks, {radius: 3, color: '#FF0000'});
 
-        const lm = results.poseLandmarks;
-        const leftHip    = lm[23], leftKnee    = lm[25], leftAnkle    = lm[27];
-        const rightHip   = lm[24], rightKnee   = lm[26], rightAnkle   = lm[28];
-        const leftAngle  = calculateAngle(leftHip, leftKnee, leftAnkle);
-        const rightAngle = calculateAngle(rightHip, rightKnee, rightAnkle);
-        const kneeAngle  = (leftAngle + rightAngle) / 2;
+        const lm     = results.poseLandmarks;
+        const angleL = calcAngle(lm[23], lm[25], lm[27]);
+        const angleR = calcAngle(lm[24], lm[26], lm[28]);
+        const angle  = (angleL + angleR) / 2;
+        minAngle     = Math.min(minAngle, angle);
 
-        if (kneeAngle < DOWN_THRESHOLD && squatState === 'up') {
-          squatState = 'down';
+        // 穩定偵測：累積幀數
+        if (angle < DOWN_THRESHOLD) { downFrames++; upFrames = 0; }
+        else if (angle > UP_THRESHOLD) { upFrames++; downFrames = 0; }
+        else { downFrames = 0; upFrames = 0; }
+
+        // 狀態切換：上→下
+        if (state === 'up' && downFrames >= STABLE_FRAMES) {
+          state    = 'down';
+          minAngle = 180;  // 重置最小角度追蹤
         }
-        if (kneeAngle > UP_THRESHOLD && squatState === 'down') {
-          squatState = 'up';
-          squatCount++;
-          countElem.textContent = squatCount;
+        // 狀態切換：下→上
+        if (state === 'down' && upFrames >= STABLE_FRAMES) {
+          state = 'up';
+          // 根據 minAngle 判斷正確或錯誤
+          if (minAngle <= DOWN_THRESHOLD) correctCount++;
+          else incorrectCount++;
+          updateCount();
         }
       }
-      canvasCtx.restore();
+      ctx.restore();
     }
 
-    const pose = new window.Pose({
-      locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/pose@0.5/${file}`
-    });
-    pose.setOptions({
-      modelComplexity: 1,
-      smoothLandmarks: true,
-      minDetectionConfidence: 0.5,
-      minTrackingConfidence: 0.5
-    });
-    pose.onResults(onResults);
+    async function initCamera() {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({video: true});
+        video.srcObject = stream;
+        await video.play();
 
-    const camera = new window.Camera(videoElement, {
-      onFrame: async () => await pose.send({image: videoElement}),
-      width: 640,
-      height: 480
-    });
-    camera.start();
+        const pose = new window.Pose({ locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/pose@0.5/${f}` });
+        pose.setOptions({ modelComplexity: 1, smoothLandmarks: true, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5 });
+        pose.onResults(onResults);
+
+        const camera = new window.Camera(video, { onFrame: async () => await pose.send({image: video}), width: 640, height: 480 });
+        camera.start();
+      } catch (err) {
+        console.error('Failed to acquire camera feed:', err);
+        alert('無法啟動相機，請確認已允許攝影機權限');
+      }
+    }
+
+    initCamera();
   </script>
 </body>
 </html>
