@@ -1,11 +1,9 @@
 #include "esp_camera.h"
 #include <WiFi.h>
 
-
 #include "wifi_credentials.h" // 引入 WiFi 憑證檔案
 #define CAMERA_MODEL_AI_THINKER // Has PSRAM
 #include "camera_pins.h"
-
 
 void startCameraServer();
 void setupLedFlash(int pin);

@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8">
+  <meta http-equiv="X-UA-Compatible" content="IE=edge">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>深蹲計數示範</title>
+  <style>
+    body { margin: 0; padding: 0; display: flex; flex-direction: column; align-items: center; font-family: sans-serif; background: #fafafa; }
+    .video-container { display: flex; flex-direction: row; justify-content: center; align-items: center; gap: 10px; }
+    video, canvas { transform: scaleX(-1); border: 1px solid #ccc; }
+    #count { margin-top: 10px; font-size: 2rem; color: #333; }
+    h1 { margin: 20px 0 10px; }
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose@0.5/pose.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils@0.3/camera_utils.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils@0.3/drawing_utils.js"></script>
+</head>
+<body>
+  <h1>深蹲次數：<span id="count">0</span></h1>
+  <div class="video-container">
+    <video id="video" width="640" height="480" autoplay muted playsinline></video>
+    <canvas id="canvas" width="640" height="480"></canvas>
+  </div>
+
+  <script>
+    const videoElement  = document.getElementById('video');
+    const canvasElement = document.getElementById('canvas');
+    const canvasCtx     = canvasElement.getContext('2d');
+    const countElem     = document.getElementById('count');
+
+    let squatCount = 0;
+    let squatState = 'up';
+    const DOWN_THRESHOLD = 90;
+    const UP_THRESHOLD   = 160;
+
+    function calculateAngle(a, middle, b) {
+      const vx1 = a.x - middle.x;
+      const vy1 = a.y - middle.y;
+      const vx2 = b.x - middle.x;
+      const vy2 = b.y - middle.y;
+      const dot = vx1 * vx2 + vy1 * vy2;
+      const mag1 = Math.hypot(vx1, vy1);
+      const mag2 = Math.hypot(vx2, vy2);
+      const cos = dot / (mag1 * mag2);
+      return Math.acos(Math.min(Math.max(cos, -1), 1)) * 180 / Math.PI;
+    }
+
+    function onResults(results) {
+      canvasCtx.save();
+      canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+      canvasCtx.drawImage(results.image, 0, 0, canvasElement.width, canvasElement.height);
+
+      if (results.poseLandmarks) {
+        window.drawConnectors(canvasCtx, results.poseLandmarks, window.POSE_CONNECTIONS, {lineWidth: 4, color: '#00FF00'});
+        window.drawLandmarks(canvasCtx, results.poseLandmarks, {lineWidth: 2, color: '#FF0000', radius: 3});
+
+        const lm = results.poseLandmarks;
+        const leftHip    = lm[23], leftKnee    = lm[25], leftAnkle    = lm[27];
+        const rightHip   = lm[24], rightKnee   = lm[26], rightAnkle   = lm[28];
+        const leftAngle  = calculateAngle(leftHip, leftKnee, leftAnkle);
+        const rightAngle = calculateAngle(rightHip, rightKnee, rightAnkle);
+        const kneeAngle  = (leftAngle + rightAngle) / 2;
+
+        if (kneeAngle < DOWN_THRESHOLD && squatState === 'up') {
+          squatState = 'down';
+        }
+        if (kneeAngle > UP_THRESHOLD && squatState === 'down') {
+          squatState = 'up';
+          squatCount++;
+          countElem.textContent = squatCount;
+        }
+      }
+      canvasCtx.restore();
+    }
+
+    const pose = new window.Pose({
+      locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/pose@0.5/${file}`
+    });
+    pose.setOptions({
+      modelComplexity: 1,
+      smoothLandmarks: true,
+      minDetectionConfidence: 0.5,
+      minTrackingConfidence: 0.5
+    });
+    pose.onResults(onResults);
+
+    const camera = new window.Camera(videoElement, {
+      onFrame: async () => await pose.send({image: videoElement}),
+      width: 640,
+      height: 480
+    });
+    camera.start();
+  </script>
+</body>
+</html>
