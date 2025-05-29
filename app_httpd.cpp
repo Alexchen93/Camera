@@ -1,16 +1,3 @@
-// Copyright 2015-2016 Espressif Systems (Shanghai) PTE LTD
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
 #include "esp_http_server.h"
 #include "esp_timer.h"
 #include "esp_camera.h"
@@ -19,6 +6,7 @@
 #include "esp32-hal-ledc.h"
 #include "sdkconfig.h"
 #include "camera_index.h"
+#include "esp_camera.h" // 在 app_httpd.cpp 裡面
 
 #if defined(ARDUINO_ARCH_ESP32) && defined(CONFIG_ARDUHAL_ESP_LOG)
 #include "esp32-hal-log.h"
@@ -104,44 +92,33 @@ void enable_led(bool en) {  // Turn LED On or Off
 }
 #endif
 
-static esp_err_t bmp_handler(httpd_req_t *req) {
-  camera_fb_t *fb = NULL;
-  esp_err_t res = ESP_OK;
-#if ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
-  uint64_t fr_start = esp_timer_get_time();
-#endif
-  fb = esp_camera_fb_get();
-  if (!fb) {
-    log_e("Camera capture failed");
-    httpd_resp_send_500(req);
-    return ESP_FAIL;
+static esp_err_t stream_handler(httpd_req_t *req){
+  camera_fb_t * fb = nullptr;
+  char part_buf[64];
+  const char* boundary = "frame";
+  // 標頭
+  httpd_resp_set_type(req, "multipart/x-mixed-replace;boundary=frame");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");  // CORS
+
+  while(true){
+    fb = esp_camera_fb_get();
+    if(!fb) {
+      httpd_resp_send_500(req);
+      return ESP_FAIL;
+    }
+    // start frame
+    size_t hlen = snprintf(part_buf, 64,
+      "\r\n--%s\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n",
+      boundary, (uint32_t)fb->len);
+    httpd_resp_send_chunk(req, part_buf, hlen);
+    httpd_resp_send_chunk(req, (const char*)fb->buf, fb->len);
+    esp_camera_fb_return(fb);
+    // 控制 FPS
+    vTaskDelay(50 / portTICK_PERIOD_MS);
   }
-
-  httpd_resp_set_type(req, "image/x-windows-bmp");
-  httpd_resp_set_hdr(req, "Content-Disposition", "inline; filename=capture.bmp");
-  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-
-  char ts[32];
-  snprintf(ts, 32, "%lld.%06ld", fb->timestamp.tv_sec, fb->timestamp.tv_usec);
-  httpd_resp_set_hdr(req, "X-Timestamp", (const char *)ts);
-
-  uint8_t *buf = NULL;
-  size_t buf_len = 0;
-  bool converted = frame2bmp(fb, &buf, &buf_len);
-  esp_camera_fb_return(fb);
-  if (!converted) {
-    log_e("BMP Conversion failed");
-    httpd_resp_send_500(req);
-    return ESP_FAIL;
-  }
-  res = httpd_resp_send(req, (const char *)buf, buf_len);
-  free(buf);
-#if ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
-  uint64_t fr_end = esp_timer_get_time();
-#endif
-  log_i("BMP: %llums, %uB", (uint64_t)((fr_end - fr_start) / 1000), buf_len);
-  return res;
+  return ESP_OK;
 }
+
 
 static size_t jpg_encode_stream(void *arg, size_t index, const void *data, size_t len) {
   jpg_chunking_t *j = (jpg_chunking_t *)arg;
@@ -206,98 +183,6 @@ static esp_err_t capture_handler(httpd_req_t *req) {
   int64_t fr_end = esp_timer_get_time();
 #endif
   log_i("JPG: %uB %ums", (uint32_t)(fb_len), (uint32_t)((fr_end - fr_start) / 1000));
-  return res;
-}
-
-static esp_err_t stream_handler(httpd_req_t *req) {
-  camera_fb_t *fb = NULL;
-  struct timeval _timestamp;
-  esp_err_t res = ESP_OK;
-  size_t _jpg_buf_len = 0;
-  uint8_t *_jpg_buf = NULL;
-  char *part_buf[128];
-
-  static int64_t last_frame = 0;
-  if (!last_frame) {
-    last_frame = esp_timer_get_time();
-  }
-
-  res = httpd_resp_set_type(req, _STREAM_CONTENT_TYPE);
-  if (res != ESP_OK) {
-    return res;
-  }
-
-  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-  httpd_resp_set_hdr(req, "X-Framerate", "60");
-
-#if CONFIG_LED_ILLUMINATOR_ENABLED
-  isStreaming = true;
-  enable_led(true);
-#endif
-
-  while (true) {
-    fb = esp_camera_fb_get();
-    if (!fb) {
-      log_e("Camera capture failed");
-      res = ESP_FAIL;
-    } else {
-      _timestamp.tv_sec = fb->timestamp.tv_sec;
-      _timestamp.tv_usec = fb->timestamp.tv_usec;
-      if (fb->format != PIXFORMAT_JPEG) {
-        bool jpeg_converted = frame2jpg(fb, 80, &_jpg_buf, &_jpg_buf_len);
-        esp_camera_fb_return(fb);
-        fb = NULL;
-        if (!jpeg_converted) {
-          log_e("JPEG compression failed");
-          res = ESP_FAIL;
-        }
-      } else {
-        _jpg_buf_len = fb->len;
-        _jpg_buf = fb->buf;
-      }
-    }
-    if (res == ESP_OK) {
-      res = httpd_resp_send_chunk(req, _STREAM_BOUNDARY, strlen(_STREAM_BOUNDARY));
-    }
-    if (res == ESP_OK) {
-      size_t hlen = snprintf((char *)part_buf, 128, _STREAM_PART, _jpg_buf_len, _timestamp.tv_sec, _timestamp.tv_usec);
-      res = httpd_resp_send_chunk(req, (const char *)part_buf, hlen);
-    }
-    if (res == ESP_OK) {
-      res = httpd_resp_send_chunk(req, (const char *)_jpg_buf, _jpg_buf_len);
-    }
-    if (fb) {
-      esp_camera_fb_return(fb);
-      fb = NULL;
-      _jpg_buf = NULL;
-    } else if (_jpg_buf) {
-      free(_jpg_buf);
-      _jpg_buf = NULL;
-    }
-    if (res != ESP_OK) {
-      log_e("Send frame failed");
-      break;
-    }
-    int64_t fr_end = esp_timer_get_time();
-
-    int64_t frame_time = fr_end - last_frame;
-    last_frame = fr_end;
-
-    frame_time /= 1000;
-#if ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
-    uint32_t avg_frame_time = ra_filter_run(&ra_filter, frame_time);
-#endif
-    log_i(
-      "MJPG: %uB %ums (%.1ffps), AVG: %ums (%.1ffps)", (uint32_t)(_jpg_buf_len), (uint32_t)frame_time, 1000.0 / (uint32_t)frame_time, avg_frame_time,
-      1000.0 / avg_frame_time
-    );
-  }
-
-#if CONFIG_LED_ILLUMINATOR_ENABLED
-  isStreaming = false;
-  enable_led(false);
-#endif
-
   return res;
 }
 
@@ -654,21 +539,11 @@ static esp_err_t win_handler(httpd_req_t *req) {
 
 static esp_err_t index_handler(httpd_req_t *req) {
   httpd_resp_set_type(req, "text/html");
-  httpd_resp_set_hdr(req, "Content-Encoding", "gzip");
-  sensor_t *s = esp_camera_sensor_get();
-  if (s != NULL) {
-    if (s->id.PID == OV3660_PID) {
-      return httpd_resp_send(req, (const char *)index_ov3660_html_gz, index_ov3660_html_gz_len);
-    } else if (s->id.PID == OV5640_PID) {
-      return httpd_resp_send(req, (const char *)index_ov5640_html_gz, index_ov5640_html_gz_len);
-    } else {
-      return httpd_resp_send(req, (const char *)index_ov2640_html_gz, index_ov2640_html_gz_len);
-    }
-  } else {
-    log_e("Camera sensor not found");
-    return httpd_resp_send_500(req);
-  }
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  // PROGMEM 字串請用 strlen_P 或 strlen 都可以
+  return httpd_resp_send(req, index_html, strlen_P(index_html));
 }
+
 
 void startCameraServer() {
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
@@ -742,7 +617,6 @@ void startCameraServer() {
   httpd_uri_t bmp_uri = {
     .uri = "/bmp",
     .method = HTTP_GET,
-    .handler = bmp_handler,
     .user_ctx = NULL
 #ifdef CONFIG_HTTPD_WS_SUPPORT
     ,
@@ -825,7 +699,6 @@ void startCameraServer() {
     httpd_register_uri_handler(camera_httpd, &cmd_uri);
     httpd_register_uri_handler(camera_httpd, &status_uri);
     httpd_register_uri_handler(camera_httpd, &capture_uri);
-    httpd_register_uri_handler(camera_httpd, &bmp_uri);
 
     httpd_register_uri_handler(camera_httpd, &xclk_uri);
     httpd_register_uri_handler(camera_httpd, &reg_uri);
